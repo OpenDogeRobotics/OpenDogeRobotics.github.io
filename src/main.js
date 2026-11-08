@@ -357,15 +357,24 @@ function seededRandom(seed) {
   };
 }
 
-function box(x, y, z, sx, sy, sz, ry = 0, label = "障碍") {
-  return { x, y, z, sx, sy, sz, ry, label };
+function box(x, y, z, sx, sy, sz, yaw = 0, label = "障碍") {
+  return { type: "box", x, y, z, sx, sy, sz, yaw, label };
 }
+
+// A ramp is a right-triangular prism: flat at -x, full height at +x. mjlab-style
+// slopes are expressed in percent, so height = length * slope / 100.
+function ramp(x, y, height, length, width, yaw = 0, label = "斜坡") {
+  return { type: "ramp", x, y, z: height / 2, sx: length / 2, sy: width / 2, sz: height / 2, yaw, label };
+}
+
+const RAMP_FACES = [0, 1, 2, 3, 5, 4, 0, 3, 4, 0, 4, 1, 1, 4, 5, 1, 5, 2, 0, 2, 5, 0, 5, 3];
+const rampVertices = ({ sx, sy, sz }) => [-sx, -sy, -sz, sx, -sy, -sz, sx, -sy, sz, -sx, sy, -sz, sx, sy, -sz, sx, sy, sz];
 
 // Terrain dimensions are sized for OpenDoge's ~0.2 m body rather than the
 // 0.4 m quadruped the original playground was built for.
 function profileBoxes() {
   const height = terrainState.height;
-  if (terrainState.kind === "slope") return [box(1.15, 0, height / 2, 0.75, 0.65, height / 2, -0.11, "坡道")];
+  if (terrainState.kind === "slope") return [ramp(1.15, 0, height * 1.5, 1.3, 1.0, 0, "坡道")];
   if (terrainState.kind === "stairs") return Array.from({ length: 7 }, (_, index) => {
     const step = index + 1;
     return box(0.55 + index * 0.16, 0, height * step / 14, 0.08, 0.45, height * step / 14, 0, "阶梯");
@@ -385,16 +394,80 @@ function profileBoxes() {
   return [];
 }
 
+const TERRAIN_ELEMENT_DEFAULTS = {
+  platform: { length: 0.32, width: 0.32, height: 0.08 },
+  wall: { length: 0.5, width: 0.06, height: 0.1 },
+  ramp: { length: 0.55, width: 0.4, height: 0.09 },
+  stairs: { stepCount: 4, stepDepth: 0.12, stepWidth: 0.4, stepHeight: 0.03 },
+  stones: { length: 0.08, width: 0.08, height: 0.06, columns: 3, rows: 2, gapX: 0.16, gapY: 0.16, layout: "aligned" },
+};
+
+function createTerrainElement(kind, x, y) {
+  const element = { kind, x, y, yaw: 0, ...TERRAIN_ELEMENT_DEFAULTS[kind] };
+  if (kind === "ramp") element.slope = element.height / element.length * 100;
+  return element;
+}
+
+function elementFootprint(element) {
+  const length = element.length ?? 0.3;
+  const width = element.width ?? 0.3;
+  if (element.kind === "stairs") {
+    const count = Math.round(element.stepCount ?? 4);
+    return { length: count * (element.stepDepth ?? 0.12), width: element.stepWidth ?? 0.4, yaw: element.yaw || 0 };
+  }
+  if (element.kind === "stones") {
+    const columns = Math.round(element.columns ?? 3);
+    const rows = Math.round(element.rows ?? 2);
+    const pitchX = length + (element.gapX ?? 0.16);
+    const pitchY = width + (element.gapY ?? 0.16);
+    const shift = element.layout === "staggered" ? pitchX / 2 : 0;
+    return { length: (columns - 1) * pitchX + length + shift, width: (rows - 1) * pitchY + width, yaw: element.yaw || 0 };
+  }
+  return { length, width, yaw: element.yaw || 0 };
+}
+
 function elementBoxes(element) {
   const { x, y, kind } = element;
   const height = Number.isFinite(element.height) ? element.height : terrainState.height;
-  const scaleX = Number.isFinite(element.scaleX) ? element.scaleX : 1;
-  const scaleY = Number.isFinite(element.scaleY) ? element.scaleY : 1;
-  if (kind === "stairs") return Array.from({ length: 5 }, (_, index) => box(x + (index - 2) * 0.09 * scaleX, y, height * (index + 1) / 10, 0.045 * scaleX, 0.25 * scaleY, height * (index + 1) / 10, element.yaw || 0, "台阶"));
-  if (kind === "ramp") return [box(x, y, height / 2, 0.4 * scaleX, 0.3 * scaleY, height / 2, element.yaw || -0.18, "斜坡")];
-  if (kind === "stones") return Array.from({ length: 6 }, (_, index) => box(x + (index % 3 - 1) * 0.14 * scaleX, y + (Math.floor(index / 3) - .5) * 0.2 * scaleY, height / 4, .045 * scaleX, .045 * scaleY, height / 4, 0, "梅花桩"));
-  if (kind === "wall") return [box(x, y, height / 2, 0.42 * scaleX, .025 * scaleY, height / 2, element.yaw || 0, "矮墙")];
-  return [box(x, y, height / 2, 0.22 * scaleX, 0.22 * scaleY, height / 2, element.yaw || 0, "高台")];
+  const length = Number.isFinite(element.length) ? element.length : 0.3;
+  const width = Number.isFinite(element.width) ? element.width : 0.3;
+  const yaw = element.yaw || 0;
+  const cos = Math.cos(yaw);
+  const sin = Math.sin(yaw);
+  const place = (localX, localY, z, sx, sy, sz, label) => box(
+    x + localX * cos - localY * sin,
+    y + localX * sin + localY * cos,
+    z, sx, sy, sz, yaw, label,
+  );
+  if (kind === "stairs") {
+    const count = Math.max(1, Math.round(element.stepCount ?? 4));
+    const depth = element.stepDepth ?? 0.12;
+    const stepWidth = element.stepWidth ?? 0.4;
+    const stepHeight = element.stepHeight ?? 0.03;
+    return Array.from({ length: count }, (_, index) => place(
+      (index - (count - 1) / 2) * depth, 0,
+      stepHeight * (index + 1) / 2, depth / 2, stepWidth / 2, stepHeight * (index + 1) / 2, "台阶",
+    ));
+  }
+  if (kind === "ramp") return [ramp(x, y, height, length, width, yaw, "斜坡")];
+  if (kind === "stones") {
+    const columns = Math.max(1, Math.round(element.columns ?? 3));
+    const rows = Math.max(1, Math.round(element.rows ?? 2));
+    const pitchX = length + (element.gapX ?? 0.16);
+    const pitchY = width + (element.gapY ?? 0.16);
+    return Array.from({ length: columns * rows }, (_, index) => {
+      const column = index % columns;
+      const row = Math.floor(index / columns);
+      const offset = element.layout === "staggered" && row % 2 ? pitchX / 2
+        : element.layout === "diagonal" ? (row - (rows - 1) / 2) * pitchX / 2 : 0;
+      return place(
+        (column - (columns - 1) / 2) * pitchX + offset,
+        (row - (rows - 1) / 2) * pitchY,
+        height / 2, length / 2, width / 2, height / 2, "梅花桩",
+      );
+    });
+  }
+  return [place(0, 0, height / 2, length / 2, width / 2, height / 2, kind === "wall" ? "矮墙" : "高台")];
 }
 
 function terrainBoxes() {
@@ -408,12 +481,20 @@ function clearTerrainVisual() {
 }
 
 function addVisualBox(definition, accent = 0x9c8a63) {
-  const mesh = new THREE.Mesh(
-    new THREE.BoxGeometry(definition.sx * 2, definition.sy * 2, definition.sz * 2),
-    new THREE.MeshStandardMaterial({ color: accent, roughness: .76, metalness: .03 }),
-  );
+  const geometry = definition.type === "ramp"
+    ? (() => {
+      const shape = new THREE.BufferGeometry();
+      shape.setAttribute("position", new THREE.Float32BufferAttribute(rampVertices(definition), 3));
+      shape.setIndex(RAMP_FACES);
+      const geometry = shape.toNonIndexed();
+      shape.dispose();
+      geometry.computeVertexNormals();
+      return geometry;
+    })()
+    : new THREE.BoxGeometry(definition.sx * 2, definition.sy * 2, definition.sz * 2);
+  const mesh = new THREE.Mesh(geometry, new THREE.MeshStandardMaterial({ color: accent, roughness: .76, metalness: .03 }));
   mesh.position.set(definition.x, definition.y, definition.z);
-  mesh.rotation.y = definition.ry;
+  mesh.rotation.z = definition.yaw || 0;
   mesh.castShadow = true;
   mesh.receiveShadow = true;
   terrainVisual.add(mesh);
@@ -429,6 +510,7 @@ function renderTerrain() {
 function terrainXml() {
   const document = new DOMParser().parseFromString(baseRobotXml, "text/xml");
   const worldbody = document.querySelector("worldbody");
+  const asset = document.querySelector("asset");
   // Joint armature and actuator gains mirror OPENDOGE_ACTUATOR_* in training.
   for (const joint of document.querySelectorAll("worldbody joint")) {
     joint.setAttribute("armature", String(ACTUATOR_ARMATURE));
@@ -451,12 +533,21 @@ function terrainXml() {
   const definitions = terrainBoxes();
   if (definitions.length > TERRAIN_SLOT_COUNT) throw new Error(`地形最多支持 ${TERRAIN_SLOT_COUNT} 个碰撞组件。`);
   definitions.forEach((definition, index) => {
+    const yaw = definition.yaw || 0;
+    if (definition.type === "ramp") {
+      const mesh = document.createElement("mesh");
+      mesh.setAttribute("name", `simulator_ramp_${index}`);
+      mesh.setAttribute("vertex", rampVertices(definition).map((value) => Number(value.toFixed(6))).join(" "));
+      mesh.setAttribute("face", RAMP_FACES.join(" "));
+      asset.append(mesh);
+    }
     const geom = document.createElement("geom");
     geom.setAttribute("name", `simulator_terrain_${index}`);
-    geom.setAttribute("type", "box");
+    geom.setAttribute("type", definition.type === "ramp" ? "mesh" : "box");
+    if (definition.type === "ramp") geom.setAttribute("mesh", `simulator_ramp_${index}`);
+    else geom.setAttribute("size", `${definition.sx} ${definition.sy} ${definition.sz}`);
     geom.setAttribute("pos", `${definition.x} ${definition.y} ${definition.z}`);
-    geom.setAttribute("size", `${definition.sx} ${definition.sy} ${definition.sz}`);
-    geom.setAttribute("euler", `0 ${definition.ry} 0`);
+    geom.setAttribute("euler", `0 0 ${yaw}`);
     geom.setAttribute("rgba", "0 0 0 0");
     geom.setAttribute("friction", "0.9 0.1 0.1");
     geom.setAttribute("solref", "0.02 1");
@@ -584,40 +675,26 @@ function observation() {
 // Vertical ray against the simulator's analytic terrain boxes (all MuJoCo
 // terrain geoms are boxes; the robot is excluded by construction). Returns the
 // distance to the first hit, or -1, matching mj_ray's convention.
-function rayDown(x, y, z, boxes) {
+// Vertical ray against the simulator's analytic terrain: boxes are yaw-rotated
+// cuboids, ramps are the same triangular prism used for rendering and physics.
+// Returns the distance to the first hit, or -1, matching mj_ray's convention.
+function rayDown(x, y, z, definitions) {
   let nearest = -1;
-  for (const definition of boxes) {
-    const { x: bx, y: by, z: bz, sx, sy, sz } = definition;
-    const angle = definition.ry || 0;
-    const cos = Math.cos(angle);
-    const sin = Math.sin(angle);
-    // Rotate the ray into the box frame (rotation about Y), then slab test.
-    const dx = x - bx;
-    const dy = y - by;
-    const dz = z - bz;
-    const px = cos * dx - sin * dz;
-    const py = dy;
-    const pz = sin * dx + cos * dz;
-    // Local ray direction: Ry^T @ (0, 0, -1) = (sin, 0, -cos).
-    let tMin = -Infinity;
-    let tMax = Infinity;
-    const axes = [[px, sx, sin], [py, sy, 0], [pz, sz, -cos]];
-    let hit = true;
-    for (const [origin, half, dir] of axes) {
-      if (Math.abs(dir) < 1e-12) {
-        if (Math.abs(origin) > half) { hit = false; break; }
-        continue;
-      }
-      let t1 = (-half - origin) / dir;
-      let t2 = (half - origin) / dir;
-      if (t1 > t2) [t1, t2] = [t2, t1];
-      tMin = Math.max(tMin, t1);
-      tMax = Math.min(tMax, t2);
-      if (tMin > tMax) { hit = false; break; }
-    }
-    if (!hit || tMax < 0) continue;
-    const distance = Math.max(tMin, 0);
-    if (distance >= 0 && (nearest < 0 || distance < nearest)) nearest = distance;
+  for (const definition of definitions) {
+    const yaw = definition.yaw || 0;
+    const cos = Math.cos(yaw);
+    const sin = Math.sin(yaw);
+    const dx = x - definition.x;
+    const dy = y - definition.y;
+    const localX = cos * dx + sin * dy;
+    const localY = -sin * dx + cos * dy;
+    if (Math.abs(localX) > definition.sx || Math.abs(localY) > definition.sy) continue;
+    const hitZ = definition.type === "ramp"
+      ? definition.z + definition.sz * (localX / definition.sx)
+      : definition.z + definition.sz;
+    if (hitZ > z) continue;
+    const distance = z - hitZ;
+    if (nearest < 0 || distance < nearest) nearest = distance;
   }
   return nearest;
 }
@@ -987,22 +1064,29 @@ function repaintTerrainMap() {
   context.lineWidth = 1;
   for (let x = 0; x <= width; x += width / 10) { context.beginPath(); context.moveTo(x, 0); context.lineTo(x, height); context.stroke(); }
   for (let y = 0; y <= height; y += height / 8) { context.beginPath(); context.moveTo(0, y); context.lineTo(width, y); context.stroke(); }
-  if (terrainState.kind === "slope") { context.fillStyle = "#d6c298"; context.fillRect(width * .56, height * .16, width * .29, height * .68); }
-  if (terrainState.kind === "stairs") {
-    context.fillStyle = "#d6c298";
-    for (let index = 0; index < 7; index += 1) context.fillRect(width * (.54 + index * .038), height * .18, width * .034, height * .64);
-  }
+  const scaleX = width / (TERRAIN_AREA.x * 2);
+  const scaleY = height / (TERRAIN_AREA.y * 2);
+  const drawFootprint = (x, y, length, breadth, yaw, fill, label, textColor) => {
+    context.save();
+    context.translate((x / (TERRAIN_AREA.x * 2) + .5) * width, (.5 - y / (TERRAIN_AREA.y * 2)) * height);
+    context.rotate(-yaw);
+    context.fillStyle = fill;
+    context.fillRect(-length / 2 * scaleX, -breadth / 2 * scaleY, length * scaleX, breadth * scaleY);
+    context.restore();
+    if (label) {
+      context.fillStyle = textColor;
+      context.font = "10px system-ui";
+      context.textAlign = "center";
+      context.fillText(label, (x / (TERRAIN_AREA.x * 2) + .5) * width, (.5 - y / (TERRAIN_AREA.y * 2)) * height + 3);
+    }
+  };
+  if (terrainState.kind === "slope") drawFootprint(1.15, 0, 1.3, 1.0, 0, "#e0cda4", "", "#5a4a26");
+  if (terrainState.kind === "stairs") drawFootprint(1.03, 0, 7 * 0.16, 0.9, 0, "#e0cda4", "", "#5a4a26");
   terrainState.elements.forEach((element, index) => {
-    const x = (element.x / (TERRAIN_AREA.x * 2) + .5) * width;
-    const y = (.5 - element.y / (TERRAIN_AREA.y * 2)) * height;
-    context.beginPath();
-    context.arc(x, y, index === terrainState.selected ? 12 : 9, 0, Math.PI * 2);
-    context.fillStyle = index === terrainState.selected ? "#b57b06" : "#9a7c3d";
-    context.fill();
-    context.fillStyle = "#fff";
-    context.font = "10px system-ui";
-    context.textAlign = "center";
-    context.fillText(String(index + 1), x, y + 3);
+    const footprint = elementFootprint(element);
+    const selected = index === terrainState.selected;
+    drawFootprint(element.x, element.y, footprint.length, footprint.width, footprint.yaw,
+      selected ? "#c9992a" : "#b9a173", String(index + 1), selected ? "#fffdf7" : "#3b3220");
   });
 }
 
@@ -1011,8 +1095,9 @@ function renderTerrainElements() {
   mount.replaceChildren(...terrainState.elements.map((element, index) => {
     const row = document.createElement("div");
     row.className = `terrain-element${index === terrainState.selected ? " selected" : ""}`;
-    const elementHeight = Number.isFinite(element.height) ? element.height : terrainState.height;
-    row.innerHTML = `<span>${index + 1}. ${terrainLabels[element.kind] ?? "导入障碍"} · ${elementHeight.toFixed(2)} m</span>`;
+    const label = terrainLabels[element.kind] ?? "导入障碍";
+    const footprint = elementFootprint(element);
+    row.innerHTML = `<span>${index + 1}. ${label} · ${footprint.length.toFixed(2)}×${footprint.width.toFixed(2)} m${element.kind === "ramp" ? ` · ${element.slope.toFixed(0)}%` : ""}</span>`;
     row.onclick = () => { terrainState.selected = index; repaintTerrainEditor(); };
     const remove = document.createElement("button");
     remove.textContent = "删除";
@@ -1038,22 +1123,124 @@ function updateTerrainElementEditor() {
   const element = terrainState.elements[terrainState.selected];
   $("terrainElementEditor").hidden = !element;
   if (!element) return;
+  $("elementEditorTitle").textContent = `${terrainLabels[element.kind] ?? "障碍"}参数`;
+  document.querySelectorAll("[data-element-for]").forEach((label) => {
+    label.hidden = !label.dataset.elementFor.split(" ").includes(element.kind);
+  });
   $("elementX").value = element.x.toFixed(2);
   $("elementY").value = element.y.toFixed(2);
-  $("elementHeight").value = (Number.isFinite(element.height) ? element.height : terrainState.height).toFixed(2);
-  $("elementScaleX").value = Number.isFinite(element.scaleX) ? element.scaleX : 1;
-  $("elementScaleY").value = Number.isFinite(element.scaleY) ? element.scaleY : 1;
   $("elementYaw").value = THREE.MathUtils.radToDeg(element.yaw || 0).toFixed(0);
+  const values = {
+    elementLength: element.length,
+    elementWidth: element.width,
+    elementHeight: element.height,
+    stepDepth: element.stepDepth,
+    stepWidth: element.stepWidth,
+    stepHeight: element.stepHeight,
+    stepCount: element.stepCount,
+    elementSlope: element.slope,
+    stoneColumns: element.columns,
+    stoneRows: element.rows,
+    stoneGapX: element.gapX,
+    stoneGapY: element.gapY,
+  };
+  for (const [id, value] of Object.entries(values)) {
+    if (value !== undefined) $(id).value = typeof value === "number" ? Number(value.toFixed(2)) : value;
+  }
+  if (element.kind === "stones") $("stoneLayout").value = element.layout ?? "aligned";
 }
 
-function addTerrainElement(position) {
-  const nearby = terrainState.elements.findIndex((element) => Math.hypot(element.x - position.x, element.y - position.y) < .3);
-  if (nearby >= 0) terrainState.selected = nearby;
-  else {
-    terrainState.elements.push({ kind: terrainState.tool, x: position.x, y: position.y, yaw: 0, height: terrainState.height, scaleX: 1, scaleY: 1 });
-    terrainState.selected = terrainState.elements.length - 1;
+function elementAt(position) {
+  for (let index = terrainState.elements.length - 1; index >= 0; index -= 1) {
+    const hit = elementBoxes(terrainState.elements[index]).some((definition) => {
+      const yaw = definition.yaw || 0;
+      const dx = position.x - definition.x;
+      const dy = position.y - definition.y;
+      const localX = Math.cos(yaw) * dx + Math.sin(yaw) * dy;
+      const localY = -Math.sin(yaw) * dx + Math.cos(yaw) * dy;
+      return Math.abs(localX) <= definition.sx && Math.abs(localY) <= definition.sy;
+    });
+    if (hit) return index;
   }
-  repaintTerrainEditor();
+  return terrainState.elements.findIndex((element) => Math.hypot(element.x - position.x, element.y - position.y) < 0.12);
+}
+
+
+function installTerrainMap() {
+  const canvas = $("terrainMap");
+  let drag = null;
+  canvas.addEventListener("pointerdown", (event) => {
+    if (event.button !== 0) return;
+    const position = terrainCanvasPosition(event);
+    const index = elementAt(position);
+    if (index >= 0) {
+      terrainState.selected = index;
+      const element = terrainState.elements[index];
+      drag = { index, offsetX: element.x - position.x, offsetY: element.y - position.y, pointerId: event.pointerId };
+      canvas.setPointerCapture(event.pointerId);
+      repaintTerrainEditor();
+    } else {
+      terrainState.elements.push(createTerrainElement(terrainState.tool, position.x, position.y));
+      terrainState.selected = terrainState.elements.length - 1;
+      repaintTerrainEditor();
+    }
+    event.preventDefault();
+  });
+  canvas.addEventListener("pointermove", (event) => {
+    if (!drag || drag.pointerId !== event.pointerId) return;
+    const position = terrainCanvasPosition(event);
+    const element = terrainState.elements[drag.index];
+    element.x = THREE.MathUtils.clamp(position.x + drag.offsetX, -TERRAIN_AREA.x, TERRAIN_AREA.x);
+    element.y = THREE.MathUtils.clamp(position.y + drag.offsetY, -TERRAIN_AREA.y, TERRAIN_AREA.y);
+    repaintTerrainEditor();
+    $("terrainHint").textContent = "障碍位置已更新预览；点击“应用到场景”同步物理碰撞。";
+    event.preventDefault();
+  });
+  const end = (event) => {
+    if (!drag || drag.pointerId !== event.pointerId) return;
+    drag = null;
+    if (canvas.hasPointerCapture(event.pointerId)) canvas.releasePointerCapture(event.pointerId);
+  };
+  canvas.addEventListener("pointerup", end);
+  canvas.addEventListener("pointercancel", end);
+}
+
+function installPanelDrag() {
+  document.querySelectorAll(".cmd-panel, .monitor-panel, .terrain-panel").forEach((panel) => {
+    const handle = panel.querySelector(".panel-heading");
+    if (!handle) return;
+    let drag = null;
+    handle.addEventListener("pointerdown", (event) => {
+      if (event.target.closest("button")) return;
+      if (event.button !== 0) return;
+      const rect = panel.getBoundingClientRect();
+      panel.style.left = `${rect.left}px`;
+      panel.style.top = `${rect.top}px`;
+      panel.style.right = "auto";
+      panel.style.bottom = "auto";
+      if (panel.classList.contains("terrain-panel")) panel.style.height = "auto";
+      drag = { pointerId: event.pointerId, offsetX: event.clientX - rect.left, offsetY: event.clientY - rect.top };
+      handle.setPointerCapture(event.pointerId);
+      event.preventDefault();
+    });
+    handle.addEventListener("pointermove", (event) => {
+      if (!drag || drag.pointerId !== event.pointerId) return;
+      const rect = panel.getBoundingClientRect();
+      const maxLeft = window.innerWidth - rect.width - 8;
+      const maxTop = window.innerHeight - 80;
+      panel.style.left = `${THREE.MathUtils.clamp(event.clientX - drag.offsetX, 8, Math.max(8, maxLeft))}px`;
+      panel.style.top = `${THREE.MathUtils.clamp(event.clientY - drag.offsetY, 48, Math.max(48, maxTop))}px`;
+      if (panel.classList.contains("terrain-panel")) panel.style.maxHeight = `${window.innerHeight - parseFloat(panel.style.top) - 12}px`;
+      event.preventDefault();
+    });
+    const end = (event) => {
+      if (!drag || drag.pointerId !== event.pointerId) return;
+      drag = null;
+      if (handle.hasPointerCapture(event.pointerId)) handle.releasePointerCapture(event.pointerId);
+    };
+    handle.addEventListener("pointerup", end);
+    handle.addEventListener("pointercancel", end);
+  });
 }
 
 function importTerrainScene(file) {
@@ -1061,13 +1248,37 @@ function importTerrainScene(file) {
   reader.onload = () => {
     try {
       const content = String(reader.result);
+      const normalize = (raw) => {
+        const aliases = { stepping_stones: "stones", high_wall: "wall" };
+        const kind = aliases[raw.kind] ?? (["platform", "stairs", "ramp", "stones", "wall"].includes(raw.kind) ? raw.kind : "platform");
+        const element = createTerrainElement(kind, Number(raw.x) || 0, Number(raw.y) || 0);
+        element.yaw = Number(raw.yaw) || 0;
+        const number = (value) => (Number.isFinite(Number(value)) ? Number(value) : undefined);
+        const scaleX = number(raw.scaleX ?? raw.scale_x);
+        const scaleY = number(raw.scaleY ?? raw.scale_y);
+        element.length = number(raw.length) ?? (scaleX !== undefined ? (TERRAIN_ELEMENT_DEFAULTS[kind].length ?? 0.3) * scaleX : element.length);
+        element.width = number(raw.width) ?? (scaleY !== undefined ? (TERRAIN_ELEMENT_DEFAULTS[kind].width ?? 0.3) * scaleY : element.width);
+        element.height = number(raw.height ?? raw.size?.[2]) ?? element.height;
+        for (const key of ["stepDepth", "stepWidth", "stepHeight", "stepCount", "columns", "rows", "gapX", "gapY"]) {
+          element[key] = number(raw[key]) ?? element[key];
+        }
+        if (["aligned", "staggered", "diagonal"].includes(raw.layout)) element.layout = raw.layout;
+        element.slope = kind === "ramp"
+          ? (number(raw.slope) ?? element.height / element.length * 100)
+          : element.slope;
+        return element;
+      };
       if (file.name.toLowerCase().endsWith(".xml")) {
         const document = new DOMParser().parseFromString(content, "text/xml");
         const imported = [...document.querySelectorAll('geom[type="box"]')].map((geom) => {
           const position = vector(geom.getAttribute("pos") ?? "", 3, [0, 0, 0]);
           const size = vector(geom.getAttribute("size") ?? "", 3, [.3, .3, .1]);
           const euler = vector(geom.getAttribute("euler") ?? "", 3, [0, 0, 0]);
-          return { kind: size[0] > 0.4 && size[1] < .12 ? "wall" : "platform", x: position[0], y: position[1], yaw: euler[1] || 0, height: size[2] * 2, scaleX: 1, scaleY: 1 };
+          return normalize({
+            kind: size[0] > 0.4 && size[1] < .12 ? "wall" : "platform",
+            x: position[0], y: position[1], yaw: euler[2] || 0,
+            length: size[0] * 2, width: size[1] * 2, height: size[2] * 2,
+          });
         });
         if (!imported.length) throw new Error("未找到可导入的 box 地形；高度场和外部 mesh 需先导出为场景 JSON。");
         terrainState.elements = imported;
@@ -1077,18 +1288,12 @@ function importTerrainScene(file) {
         if (terrain.kind && ["flat", "slope", "stairs", "obstacle_mix"].includes(terrain.kind)) terrainState.kind = terrain.kind;
         terrainState.seed = Number(terrain.seed ?? terrainState.seed);
         terrainState.height = Number(terrain.height ?? terrain.obstacle_height ?? terrainState.height);
-        terrainState.elements = (scene.elements ?? []).map((element) => ({
-          kind: ["platform", "stairs", "ramp", "stepping_stones", "high_wall"].includes(element.kind)
-            ? ({ stepping_stones: "stones", high_wall: "wall" }[element.kind] ?? element.kind)
-            : "platform",
-          x: Number(element.x) || 0, y: Number(element.y) || 0, yaw: Number(element.yaw) || 0,
-          height: Number(element.height ?? element.size?.[2] ?? terrainState.height),
-          scaleX: Number(element.scaleX ?? element.scale_x ?? 1), scaleY: Number(element.scaleY ?? element.scale_y ?? 1),
-        }));
+        terrainState.elements = (scene.elements ?? []).map(normalize);
       }
       terrainState.selected = null;
       $("terrainKind").value = terrainState.kind;
       $("terrainSeed").value = terrainState.seed;
+      repaintTerrainEditor();
       setNotice("地形已导入预览；点击“应用到场景”后写入浏览器内 MuJoCo 物理模型。");
     } catch (error) { setNotice(error.message || String(error), true); }
   };
@@ -1096,7 +1301,12 @@ function importTerrainScene(file) {
 }
 
 function exportTerrainScene() {
-  const payload = { version: 1, name: "opendoge-terrain", terrain: { kind: terrainState.kind, seed: terrainState.seed, height: terrainState.height }, elements: terrainState.elements };
+  const payload = {
+    version: 2,
+    name: "opendoge-terrain",
+    terrain: { kind: terrainState.kind, seed: terrainState.seed, height: terrainState.height },
+    elements: terrainState.elements,
+  };
   const url = URL.createObjectURL(new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" }));
   const anchor = document.createElement("a");
   anchor.href = url;
@@ -1214,18 +1424,39 @@ $("terrainKind").onchange = (event) => { terrainState.kind = event.target.value;
 $("terrainSeed").oninput = (event) => { terrainState.seed = Number(event.target.value) || 0; repaintTerrainEditor(); };
 function editSelectedTerrain(key, value) {
   const element = terrainState.elements[terrainState.selected];
-  if (!element || !Number.isFinite(value)) return;
+  if (!element || !Number.isFinite(value)) { updateTerrainElementEditor(); return; }
   if (key === "x") value = THREE.MathUtils.clamp(value, -TERRAIN_AREA.x, TERRAIN_AREA.x);
   if (key === "y") value = THREE.MathUtils.clamp(value, -TERRAIN_AREA.y, TERRAIN_AREA.y);
+  if (key === "yaw") value = THREE.MathUtils.degToRad(value);
+  if (["length", "width", "height", "stepDepth", "stepWidth", "stepHeight", "gapX", "gapY"].includes(key)) {
+    value = THREE.MathUtils.clamp(value, 0.02, 10);
+  }
+  if (key === "stepCount") value = THREE.MathUtils.clamp(Math.round(value), 1, 20);
+  if (key === "columns" || key === "rows") value = THREE.MathUtils.clamp(Math.round(value), 1, 8);
   element[key] = value;
+  if (element.kind === "ramp") {
+    if (key === "slope" || key === "length") element.height = element.length * element.slope / 100;
+    if (key === "height") element.slope = element.height / element.length * 100;
+  }
   repaintTerrainEditor();
 }
-$("elementX").onchange = (event) => editSelectedTerrain("x", Number(event.target.value));
-$("elementY").onchange = (event) => editSelectedTerrain("y", Number(event.target.value));
-$("elementHeight").onchange = (event) => editSelectedTerrain("height", Number(event.target.value));
-$("elementScaleX").onchange = (event) => editSelectedTerrain("scaleX", Number(event.target.value));
-$("elementScaleY").onchange = (event) => editSelectedTerrain("scaleY", Number(event.target.value));
-$("elementYaw").onchange = (event) => editSelectedTerrain("yaw", THREE.MathUtils.degToRad(Number(event.target.value)));
+
+const terrainFieldMap = {
+  elementX: "x", elementY: "y", elementYaw: "yaw",
+  elementLength: "length", elementWidth: "width", elementHeight: "height",
+  stepDepth: "stepDepth", stepWidth: "stepWidth", stepHeight: "stepHeight", stepCount: "stepCount",
+  elementSlope: "slope", stoneColumns: "columns", stoneRows: "rows",
+  stoneGapX: "gapX", stoneGapY: "gapY",
+};
+for (const [id, key] of Object.entries(terrainFieldMap)) {
+  $(id).onchange = (event) => editSelectedTerrain(key, Number(event.target.value));
+}
+$("stoneLayout").onchange = (event) => {
+  const element = terrainState.elements[terrainState.selected];
+  if (!element) return;
+  element.layout = event.target.value;
+  repaintTerrainEditor();
+};
 document.querySelectorAll("[data-terrain-tool]").forEach((button) => {
   button.onclick = () => {
     terrainState.tool = button.dataset.terrainTool;
@@ -1233,7 +1464,6 @@ document.querySelectorAll("[data-terrain-tool]").forEach((button) => {
     $("terrainHint").textContent = `当前工具：${terrainLabels[terrainState.tool]}。在场地中点击放置。`;
   };
 });
-$("terrainMap").onclick = (event) => addTerrainElement(terrainCanvasPosition(event));
 $("terrainClear").onclick = () => { terrainState.elements = []; terrainState.selected = null; repaintTerrainEditor(); };
 $("terrainApply").onclick = () => {
   applyTerrain().catch((error) => { setStatus("地形同步失败", "error"); setNotice(error.message || String(error), true); });
@@ -1256,6 +1486,8 @@ $("commandStop").onclick = () => {
   recomputeCommand();
 };
 installJoystick("leftJoystick", "left");
+installTerrainMap();
+installPanelDrag();
 installJoystick("rightJoystick", "right");
 installKeyboardControl();
 

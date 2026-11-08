@@ -88,7 +88,10 @@ button.primary:hover:not(:disabled) { background: #f7c23f; border-color: #b57b06
 
 .terrain-panel { background: #fffdf7f5; border-left: 1px solid var(--line); box-shadow: -10px 0 34px #4a380c1a; display: flex; flex-direction: column; gap: 10px; max-width: min(390px, 100vw); overflow: auto; padding: 14px; position: absolute; right: 0; top: 43px; bottom: 0; width: 390px; z-index: 3; backdrop-filter: blur(12px); }
 .terrain-panel[hidden] { display: none; }
-.panel-heading { align-items: start; display: flex; justify-content: space-between; }
+.panel-heading { align-items: start; cursor: grab; display: flex; justify-content: space-between; touch-action: none; user-select: none; }
+.panel-heading:active { cursor: grabbing; }
+.terrain-element-editor label[hidden] { display: none; }
+.terrain-element-editor select { background: #fffdf7; border: 1px solid var(--line); border-radius: 4px; color: var(--ink); padding: .27rem; }
 .panel-heading strong { color: var(--ink); font-size: .88rem; }
 .panel-kicker { color: var(--amber-deep); font-size: .58rem; font-weight: 750; letter-spacing: .12em; margin: 0 0 .2rem; }
 .panel-copy, .terrain-hint { color: var(--ink-soft); font-size: .68rem; line-height: 1.45; margin: 0; }
