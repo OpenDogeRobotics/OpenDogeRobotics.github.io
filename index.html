@@ -10,13 +10,20 @@
   </head>
   <body>
     <main id="scene" aria-label="OpenDoge MuJoCo 策略仿真画面">
+      <div class="hud" aria-hidden="true"><i></i><i></i><i></i><i></i></div>
       <div id="bootScreen" class="boot-screen" role="status">
-        <div class="boot-mark">OPENDOGE / SIMULATOR</div>
-        <div class="boot-spinner" aria-hidden="true"></div>
-        <strong>正在准备 OpenDoge 在线仿真器</strong>
-        <span id="bootStage">初始化场景…</span>
-        <div class="boot-progress" aria-label="加载进度"><i id="bootProgress"></i></div>
-        <output id="bootPercent">0%</output>
+        <div class="boot-panel">
+          <div class="boot-mark">OPENDOGE<span>/</span>SIMULATOR</div>
+          <div class="boot-log" id="bootLog"><div><b>$</b> boot opendoge.sim --policy flat --device wasm</div></div>
+          <div class="boot-meter">
+            <div class="boot-progress" aria-label="加载进度"><i id="bootProgress"></i></div>
+            <div class="boot-readout">
+              <output id="bootPercent">0%</output>
+              <output id="bootBytes">0.0 / 0.0 MB</output>
+            </div>
+          </div>
+          <div class="boot-status"><strong>正在加载</strong><span id="bootStage">初始化…</span></div>
+        </div>
       </div>
 
       <header class="top-bar">

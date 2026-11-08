@@ -153,10 +153,87 @@ function setNotice(text, error = false) {
   if (error) console.warn(text);
 }
 
-function setBootStage(text, progress) {
+const bootState = { loaded: 0, total: 0, counted: new Set(), pending: false };
+const megabytes = (bytes) => `${(bytes / 1048576).toFixed(1)} MB`;
+
+function renderBootMeter() {
+  bootState.pending = false;
+  const fraction = bootState.total > 0 ? Math.min(1, bootState.loaded / bootState.total) : 0;
+  $("bootProgress").style.width = `${(fraction * 100).toFixed(1)}%`;
+  $("bootPercent").textContent = `${Math.round(fraction * 100)}%`;
+  $("bootBytes").textContent = `${megabytes(bootState.loaded)} / ${megabytes(bootState.total)}`;
+}
+
+function scheduleBootMeter() {
+  if (bootState.pending) return;
+  bootState.pending = true;
+  requestAnimationFrame(renderBootMeter);
+}
+
+function setBootStage(text) {
   $("bootStage").textContent = text;
-  $("bootProgress").style.width = `${progress}%`;
-  $("bootPercent").textContent = `${progress}%`;
+}
+
+function bootLog(text, kind = "") {
+  const line = document.createElement("div");
+  const tag = kind === "ok" ? "em" : kind === "dim" ? "i" : "span";
+  line.innerHTML = `<b>&gt;</b> <${tag}>${text}</${tag}>`;
+  const log = $("bootLog");
+  log.append(line);
+  while (log.children.length > 7) log.firstElementChild.remove();
+}
+
+// Ask the server for exact sizes first so the meter has a real denominator
+// instead of a hard-coded stage percentage.
+async function preflight(urls) {
+  await Promise.all(urls.map(async (url) => {
+    try {
+      const response = await fetch(url, { method: "HEAD" });
+      const length = Number(response.headers.get("content-length")) || 0;
+      if (length > 0 && !bootState.counted.has(url)) {
+        bootState.counted.add(url);
+        bootState.total += length;
+      }
+    } catch {
+      // Fall back to the GET response's content-length below.
+    }
+  }));
+  scheduleBootMeter();
+}
+
+async function fetchTracked(url, label) {
+  setBootStage(label);
+  const response = await fetch(url);
+  if (!response.ok) throw new Error(`${label}：HTTP ${response.status}`);
+  const length = Number(response.headers.get("content-length")) || 0;
+  if (length > 0 && !bootState.counted.has(url)) {
+    bootState.counted.add(url);
+    bootState.total += length;
+  }
+  if (!response.body) {
+    const buffer = await response.arrayBuffer();
+    bootState.loaded += buffer.byteLength;
+    scheduleBootMeter();
+    return buffer;
+  }
+  const reader = response.body.getReader();
+  const chunks = [];
+  let received = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    chunks.push(value);
+    received += value.byteLength;
+    bootState.loaded += value.byteLength;
+    scheduleBootMeter();
+  }
+  const merged = new Uint8Array(received);
+  let offset = 0;
+  for (const chunk of chunks) {
+    merged.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return merged.buffer;
 }
 
 function revealScene() {
@@ -245,6 +322,12 @@ const raycaster = new THREE.Raycaster();
 const pointer = new THREE.Vector2();
 const dragPlane = new THREE.Plane(new THREE.Vector3(0, 0, 1), 0);
 const dragArrow = new THREE.ArrowHelper(new THREE.Vector3(1, 0, 0), new THREE.Vector3(), 0, 0xb57b06, 0.05, 0.025);
+// Draw on top of the robot: the arrow is anchored at the torso centre of mass,
+// so without this the tail is hidden inside the body and looks off-centre.
+dragArrow.line.material.depthTest = false;
+dragArrow.cone.material.depthTest = false;
+dragArrow.line.renderOrder = 10;
+dragArrow.cone.renderOrder = 10;
 dragArrow.visible = false;
 view.scene.add(dragArrow);
 let robotDrag = null;
@@ -273,9 +356,9 @@ function parseMeshAssets(xml) {
   }));
 }
 
-async function buildRobot(xml, meshes) {
+async function buildRobot(xml, meshes, meshBuffers) {
   const loader = new STLLoader();
-  const geometries = new Map(await Promise.all(meshes.map(async ({ name, file }) => [name, await loader.loadAsync(publicAsset(`robot/assets/${file}`))])));
+  const geometries = new Map(meshes.map(({ name }, index) => [name, loader.parse(meshBuffers[index])]));
   const document = new DOMParser().parseFromString(xml, "text/xml");
   robot.clear();
   bodyNodes.clear();
@@ -307,17 +390,16 @@ async function buildRobot(xml, meshes) {
   for (const body of document.querySelectorAll("worldbody > body")) visit(body);
 }
 
-async function initializeMujoco() {
-  // Vite pre-bundles JS dependencies during development, but the Emscripten
-  // loader resolves its sidecar WASM relative to that transient cache path.
-  // Giving it Vite's emitted URL makes dev and production use the same binary.
+async function initializeMujoco(xml, meshes, meshBuffers, wasmBinary) {
+  // The Emscripten loader normally fetches mujoco.wasm itself; handing it the
+  // pre-fetched binary keeps the boot meter byte-accurate and avoids a second
+  // download in dev.
   mujoco = await loadMujoco({
+    wasmBinary,
     locateFile: (file) => (file === "mujoco.wasm" ? mujocoWasmUrl : file),
   });
-  baseRobotXml = await fetch(publicAsset("robot/opendoge.xml")).then((response) => response.text());
-  const meshes = parseMeshAssets(baseRobotXml);
-  const binaries = await Promise.all(meshes.map(async ({ file }) => [file, new Uint8Array(await (await fetch(publicAsset(`robot/assets/${file}`))).arrayBuffer())]));
-  robotAssets = binaries;
+  baseRobotXml = xml;
+  robotAssets = meshes.map(({ file }, index) => [file, new Uint8Array(meshBuffers[index])]);
   robotVfs = new mujoco.MjVFS();
   for (const [file, buffer] of robotAssets) robotVfs.addBuffer(`assets/${file}`, buffer);
   createMujocoModel(terrainXml(), terrainBoxes().length);
@@ -596,7 +678,7 @@ async function applyTerrain() {
   }
 }
 
-async function loadPolicy(key) {
+async function loadPolicy(key, buffer) {
   activePolicy = policies[key];
   simulation.running = false;
   $("start").textContent = "开始";
@@ -608,9 +690,9 @@ async function loadPolicy(key) {
   recomputeCommand();
   updateControls();
   setNotice(`正在加载「${activePolicy.name}」ONNX 策略…`);
-  policySession = await ort.InferenceSession.create(publicAsset(activePolicy.file), { executionProviders: ["wasm"] });
+  policySession = await ort.InferenceSession.create(buffer ?? publicAsset(activePolicy.file), { executionProviders: ["wasm"] });
   reset();
-  setNotice(`${activePolicy.note} 点击“开始”后，物理和策略均在此浏览器内运行。`);
+  setNotice(`${activePolicy.note} 点击“开始”后，物理和策略均在此浏览器中运行。`);
 }
 
 function reset() {
@@ -948,11 +1030,10 @@ function installRobotDrag() {
     if (event.button !== 0) return;
     const hit = robotHit(event);
     if (!hit) return;
-    const point = hit.point.clone();
-    const planePoint = new THREE.Vector3(point.x, point.y, 0);
     view.orbit.enabled = false;
+    dragPlane.set(new THREE.Vector3(0, 0, 1), -data.qpos[2]);
     robotDrag = {
-      start: planePoint,
+      start: new THREE.Vector3(data.qpos[0], data.qpos[1], data.qpos[2]),
       vector: new THREE.Vector3(),
       pointerId: event.pointerId,
     };
@@ -964,6 +1045,9 @@ function installRobotDrag() {
     updatePointer(event);
     const target = new THREE.Vector3();
     if (!raycaster.ray.intersectPlane(dragPlane, target)) return;
+    // The arrow always starts at the torso centre of mass, so the user sees a
+    // force applied to the body rather than to the surface point they grabbed.
+    robotDrag.start.set(data.qpos[0], data.qpos[1], data.qpos[2]);
     robotDrag.vector.set(target.x - robotDrag.start.x, target.y - robotDrag.start.y, 0);
     const length = robotDrag.vector.length();
     dragArrow.position.copy(robotDrag.start);
@@ -976,6 +1060,7 @@ function installRobotDrag() {
   const release = (event) => {
     if (!robotDrag || !data) return;
     const impulse = robotDrag.vector.clone().multiplyScalar(1.4);
+    if (impulse.length() > 1.2) impulse.setLength(1.2);
     data.qvel[0] += impulse.x;
     data.qvel[1] += impulse.y;
     dragArrow.visible = false;
@@ -1491,35 +1576,63 @@ installPanelDrag();
 installJoystick("rightJoystick", "right");
 installKeyboardControl();
 
-setBootStage("加载机器人模型…", 8);
-const modelText = fetch(publicAsset("robot/opendoge.xml")).then((response) => response.text());
-const robotTask = modelText
-  .then(async (xml) => {
-    await buildRobot(xml, parseMeshAssets(xml));
-    setBootStage("机器人模型已就绪…", 38);
-  });
-const engineTask = initializeMujoco().then(() => setBootStage("MuJoCo 物理引擎已就绪…", 68));
+async function boot() {
+  const started = performance.now();
+  const policyKey = "flat";
 
-Promise.all([robotTask, engineTask])
-  .then(() => {
-    setBootStage("加载策略网络…", 82);
-    return loadPolicy("flat");
-  })
-  .then(() => {
-    $("start").disabled = false;
-    $("reset").disabled = false;
-    $("cmdToggle").disabled = false;
-    $("monitorToggle").disabled = false;
-    $("terrainToggle").disabled = false;
-    installRobotDrag();
-    setStatus("浏览器物理引擎已就绪", "ready");
-    setBootStage("场景已就绪", 100);
-    tick();
-    requestAnimationFrame(revealScene);
-  })
-  .catch((error) => {
-    console.error(error);
-    setStatus("仿真器初始化失败", "error");
-    setNotice(error.message || String(error), true);
-    setBootStage("初始化失败，请检查浏览器控制台", 100);
-  });
+  const xmlBuffer = await fetchTracked(publicAsset("robot/opendoge.xml"), "读取 MJCF 模型…");
+  const xml = new TextDecoder().decode(xmlBuffer);
+  const meshes = parseMeshAssets(xml);
+  bootLog(`MJCF 解析完成 · ${meshes.length} 个网格`, "dim");
+
+  const policyUrl = publicAsset(policies[policyKey].file);
+  const meshUrls = meshes.map(({ file }) => publicAsset(`robot/assets/${file}`));
+  const urls = [...meshUrls, mujocoWasmUrl, ortWasmUrl, policyUrl];
+  setBootStage("预检资源大小…");
+  await preflight(urls);
+  bootLog(`资源 ${urls.length} 项 · ${megabytes(bootState.total)}`, "dim");
+
+  const [mujocoBinary, ortBinary, policyBuffer, ...meshBuffers] = await Promise.all([
+    fetchTracked(mujocoWasmUrl, "下载 MuJoCo 引擎…"),
+    fetchTracked(ortWasmUrl, "下载 ONNX Runtime…"),
+    fetchTracked(policyUrl, "下载策略网络…"),
+    ...meshUrls.map((url) => fetchTracked(url, "下载机器人网格…")),
+  ]);
+  bootLog(`下载完成 · ${megabytes(bootState.loaded)}`, "ok");
+
+  // Hand ONNX Runtime the pre-fetched binary so it does not fetch it again.
+  ort.env.wasm.wasmBinary = new Uint8Array(ortBinary);
+
+  setBootStage("编译物理引擎…");
+  await initializeMujoco(xml, meshes, meshBuffers, mujocoBinary);
+  bootLog("MuJoCo 引擎就绪", "ok");
+
+  setBootStage("装配渲染场景…");
+  await buildRobot(xml, meshes, meshBuffers);
+  bootLog("机器人网格已装配", "ok");
+
+  setBootStage("载入策略网络…");
+  await loadPolicy(policyKey, policyBuffer);
+  bootLog(`策略 ${policies[policyKey].name} 已载入`, "ok");
+
+  $("start").disabled = false;
+  $("reset").disabled = false;
+  $("cmdToggle").disabled = false;
+  $("monitorToggle").disabled = false;
+  $("terrainToggle").disabled = false;
+  installRobotDrag();
+  setStatus("浏览器物理引擎已就绪", "ready");
+  setBootStage("场景已就绪");
+  renderBootMeter();
+  bootLog(`启动完成 · ${((performance.now() - started) / 1000).toFixed(1)} s`, "ok");
+  tick();
+  requestAnimationFrame(revealScene);
+}
+
+boot().catch((error) => {
+  console.error(error);
+  setStatus("仿真器初始化失败", "error");
+  setNotice(error.message || String(error), true);
+  setBootStage("初始化失败，请检查浏览器控制台");
+  bootLog(error.message || String(error), "dim");
+});
