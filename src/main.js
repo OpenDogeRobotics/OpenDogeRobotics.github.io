@@ -117,10 +117,10 @@ const TERRAIN_AREA = { x: 3.5, y: 2.5 };
 const TERRAIN_SLOT_COUNT = 96;
 
 const meshColor = (name) => {
-  if (name.startsWith("base_link")) return 0xd2d8dc;
-  if (name.includes("hip")) return 0x59636d;
-  if (name.includes("thigh")) return 0x8f99a2;
-  return 0xb9c2c8;
+  if (name.startsWith("base_link")) return 0xdcd8d0;
+  if (name.includes("hip")) return 0x4a4944;
+  if (name.includes("thigh")) return 0x95928b;
+  return 0xc3c0b8;
 };
 
 const $ = (id) => document.getElementById(id);
@@ -166,7 +166,7 @@ function revealScene() {
 function createScene() {
   const mount = $("scene");
   const scene = new THREE.Scene();
-  scene.background = new THREE.Color("#edf0f3");
+  scene.background = new THREE.Color("#faf5e9");
   const camera = new THREE.PerspectiveCamera(40, 1, 0.01, 200);
   camera.up.set(0, 0, 1);
   const renderer = new THREE.WebGLRenderer({ antialias: true });
@@ -186,8 +186,8 @@ function createScene() {
   orbit.zoomSpeed = 0.72;
   orbit.minDistance = 0.25;
   orbit.maxDistance = 6;
-  scene.add(new THREE.HemisphereLight(0xffffff, 0x98a5b1, 2.2));
-  const key = new THREE.DirectionalLight(0xffffff, 2.4);
+  scene.add(new THREE.HemisphereLight(0xffffff, 0xd6cab4, 2.0));
+  const key = new THREE.DirectionalLight(0xfffaf0, 2.2);
   key.position.set(1.2, -1.8, 2.6);
   key.castShadow = true;
   key.shadow.mapSize.set(2048, 2048);
@@ -201,12 +201,12 @@ function createScene() {
   scene.add(key);
   const floor = new THREE.Mesh(
     new THREE.PlaneGeometry(TERRAIN_AREA.x * 3.4, TERRAIN_AREA.y * 3.4),
-    new THREE.MeshStandardMaterial({ color: 0xdfe4e8, roughness: 0.92 }),
+    new THREE.MeshStandardMaterial({ color: 0xf3ebd9, roughness: 0.92 }),
   );
   floor.receiveShadow = true;
   floor.position.z = -0.002;
   scene.add(floor);
-  const grid = new THREE.GridHelper(TERRAIN_AREA.x * 3.4, 68, 0xb7c1ca, 0xd7dde2);
+  const grid = new THREE.GridHelper(TERRAIN_AREA.x * 3.4, 68, 0xd9c9a6, 0xeee3cb);
   // GridHelper is horizontal in Three.js' Y-up world. This scene and MuJoCo
   // model use Z-up, so rotate it onto the physical floor plane.
   grid.rotation.x = Math.PI / 2;
@@ -244,7 +244,7 @@ const bodyNodes = new Map();
 const raycaster = new THREE.Raycaster();
 const pointer = new THREE.Vector2();
 const dragPlane = new THREE.Plane(new THREE.Vector3(0, 0, 1), 0);
-const dragArrow = new THREE.ArrowHelper(new THREE.Vector3(1, 0, 0), new THREE.Vector3(), 0, 0x1e75ae, 0.05, 0.025);
+const dragArrow = new THREE.ArrowHelper(new THREE.Vector3(1, 0, 0), new THREE.Vector3(), 0, 0xb57b06, 0.05, 0.025);
 dragArrow.visible = false;
 view.scene.add(dragArrow);
 let robotDrag = null;
@@ -407,7 +407,7 @@ function clearTerrainVisual() {
   terrainVisual.clear();
 }
 
-function addVisualBox(definition, accent = 0x7f9bb0) {
+function addVisualBox(definition, accent = 0x9c8a63) {
   const mesh = new THREE.Mesh(
     new THREE.BoxGeometry(definition.sx * 2, definition.sy * 2, definition.sz * 2),
     new THREE.MeshStandardMaterial({ color: accent, roughness: .76, metalness: .03 }),
@@ -421,9 +421,9 @@ function addVisualBox(definition, accent = 0x7f9bb0) {
 
 function renderTerrain() {
   clearTerrainVisual();
-  view.floor.material.color.set(terrainState.kind === "flat" ? 0xdfe4e8 : 0xd7e1e6);
-  for (const definition of profileBoxes()) addVisualBox(definition, 0x9aabba);
-  for (const element of terrainState.elements) for (const definition of elementBoxes(element)) addVisualBox(definition, 0x6f94ae);
+  view.floor.material.color.set(terrainState.kind === "flat" ? 0xf3ebd9 : 0xeee4cd);
+  for (const definition of profileBoxes()) addVisualBox(definition, 0xc3ae83);
+  for (const element of terrainState.elements) for (const definition of elementBoxes(element)) addVisualBox(definition, 0xa8873f);
 }
 
 function terrainXml() {
@@ -788,15 +788,15 @@ function drawActionChart() {
   const context = canvas.getContext("2d");
   const { width, height } = canvas;
   context.clearRect(0, 0, width, height);
-  context.fillStyle = "#edf2f5";
+  context.fillStyle = "#fdf8ea";
   context.fillRect(0, 0, width, height);
-  context.strokeStyle = "#cbd8e0";
+  context.strokeStyle = "#ecdfc3";
   context.lineWidth = 1;
   for (let row = 1; row < 4; row += 1) { const y = height * row / 4; context.beginPath(); context.moveTo(0, y); context.lineTo(width, y); context.stroke(); }
-  context.strokeStyle = "#9bb0be";
+  context.strokeStyle = "#cdbb95";
   context.beginPath(); context.moveTo(0, height / 2); context.lineTo(width, height / 2); context.stroke();
   const samples = simulation.actionHistory;
-  const palette = ["#185a91", "#4d7b4a", "#ae6c32", "#825eaa", "#b14955", "#347d8b"];
+  const palette = ["#a8760a", "#17140d", "#d19a1e", "#6f5a2d", "#b4551e", "#4a463c"];
   if (samples.length > 1) {
     for (let joint = 0; joint < 12; joint += 1) {
       context.beginPath();
@@ -981,15 +981,15 @@ function repaintTerrainMap() {
   const context = canvas.getContext("2d");
   const { width, height } = canvas;
   context.clearRect(0, 0, width, height);
-  context.fillStyle = terrainState.kind === "flat" ? "#e7eee8" : "#dde8eb";
+  context.fillStyle = terrainState.kind === "flat" ? "#f7efdc" : "#f2e7cd";
   context.fillRect(0, 0, width, height);
-  context.strokeStyle = "#c1d0d5";
+  context.strokeStyle = "#ddcfae";
   context.lineWidth = 1;
   for (let x = 0; x <= width; x += width / 10) { context.beginPath(); context.moveTo(x, 0); context.lineTo(x, height); context.stroke(); }
   for (let y = 0; y <= height; y += height / 8) { context.beginPath(); context.moveTo(0, y); context.lineTo(width, y); context.stroke(); }
-  if (terrainState.kind === "slope") { context.fillStyle = "#9db6c5"; context.fillRect(width * .56, height * .16, width * .29, height * .68); }
+  if (terrainState.kind === "slope") { context.fillStyle = "#d6c298"; context.fillRect(width * .56, height * .16, width * .29, height * .68); }
   if (terrainState.kind === "stairs") {
-    context.fillStyle = "#9db6c5";
+    context.fillStyle = "#d6c298";
     for (let index = 0; index < 7; index += 1) context.fillRect(width * (.54 + index * .038), height * .18, width * .034, height * .64);
   }
   terrainState.elements.forEach((element, index) => {
@@ -997,7 +997,7 @@ function repaintTerrainMap() {
     const y = (.5 - element.y / (TERRAIN_AREA.y * 2)) * height;
     context.beginPath();
     context.arc(x, y, index === terrainState.selected ? 12 : 9, 0, Math.PI * 2);
-    context.fillStyle = index === terrainState.selected ? "#185a91" : "#6f94ae";
+    context.fillStyle = index === terrainState.selected ? "#b57b06" : "#9a7c3d";
     context.fill();
     context.fillStyle = "#fff";
     context.font = "10px system-ui";
