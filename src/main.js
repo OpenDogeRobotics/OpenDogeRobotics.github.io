@@ -18,10 +18,8 @@ ort.env.wasm.wasmPaths = {
 ort.env.wasm.numThreads = 1;
 ort.env.wasm.proxy = false;
 
-// Policies trained by OpenDoge_train.  Both use the mjlab velocity observation
-// layout (48 fields) and the same 12-joint position action space:
-//   [lin_vel(3), ang_vel(3), projected_gravity(3), joint_pos(12),
-//    joint_vel(12), last_action(12), command(3)]
+// Policies use the same 12-joint position action space but may have distinct
+// observation contracts: single-frame velocity/skills and SuperMimic history.
 const skillNames = ["walk", "handstand", "getup", "jump"];
 const policies = {
   flat: {
@@ -34,13 +32,18 @@ const policies = {
     note: "LainLab-OpenDoge-Flat 基线策略：平地速度跟踪，可用摇杆或 WASD/QE 给出 vx、vy、ω 指令。",
   },
   rough: {
-    name: "粗地形行走",
-    file: "/policies/opendoge-rough.onnx",
-    inputSize: 213,
-    mode: "rough",
+    name: "SuperMimic-MoE · 粗地形",
+    file: "/policies/opendoge-supermimic-moects.onnx",
+    inputSize: 235,
+    frameSize: 47,
+    historyLength: 5,
+    mode: "supermimic",
+    timestep: 0.005,
+    physicsStepsPerPolicy: 4,
     init: "stand",
-    commandRanges: { vx: [-0.6, 0.8], vy: [-0.4, 0.4], yaw: [-0.7, 0.7] },
-    note: "LainLab-OpenDoge-Rough 基线策略：48 维本体观测 + 165 维地形高度扫描，可在“地形”面板里加台阶或坡道试。",
+    actionScale: [0.25, 0.4, 0.4, 0.25, 0.4, 0.4, 0.25, 0.4, 0.4, 0.25, 0.4, 0.4],
+    commandRanges: { vx: [-0.6, 0.6], vy: [-0.5, 0.5], yaw: [-1.5, 1.5] },
+    note: "SuperMimic-MoE 历史策略：5 帧 × 47 维盲本体观测，含步态相位和按关节动作缩放。",
   },
   skillsWalk: {
     name: "多技能 · 行走",
@@ -96,24 +99,15 @@ const ACTUATOR_KP = 12.0;
 const ACTUATOR_KD = 0.5;
 const ACTUATOR_ARMATURE = 0.005;
 const ACTION_SCALE = 0.25;
+const SUPER_MIMIC_PHASE_PERIOD = 0.5;
+const SUPER_MIMIC_STANDING_THRESHOLD = 0.1;
 
-// MuJoCo settings used for training: 2 ms physics, 2 physics steps per policy
-// step (250 Hz control).
-const MUJOCO_TIMESTEP = 0.002;
-const POLICY_PHYSICS_STEPS = 2;
-const POLICY_DT = MUJOCO_TIMESTEP * POLICY_PHYSICS_STEPS;
+// Legacy policies retain their 4 ms control interval. SuperMimic overrides
+// these with the training configuration: 5 ms physics × 4 = 20 ms (50 Hz).
+const DEFAULT_MUJOCO_TIMESTEP = 0.002;
+const DEFAULT_POLICY_PHYSICS_STEPS = 2;
 
-// Terrain height scan for the rough policy: mjlab's GridPatternCfg with
-// size=(0.7, 0.5) and resolution=0.05, ordered y-outer / x-inner as
-// torch.meshgrid(indexing="xy") flattens it. Misses report max_distance and the
-// observation term scales everything by 1 / max_distance.
-const SCAN_COLUMNS = 15;
-const SCAN_ROWS = 11;
-const SCAN_STEP = 0.05;
-const SCAN_MISS = 5.0;
-const SCAN_SCALE = 1 / SCAN_MISS;
-
-const TERRAIN_AREA = { x: 3.5, y: 2.5 };
+const TERRAIN_AREA = { x: 5, y: 5 };
 const TERRAIN_SLOT_COUNT = 96;
 
 const meshColor = (name) => {
@@ -132,12 +126,13 @@ const simulation = {
   realTimeAccumulator: 0,
   action: new Float32Array(12),
   actionHistory: [],
+  observationHistory: [],
   command: [0, 0, 0],
 };
 const terrainState = { kind: "flat", seed: 7, height: 0.08, tool: "platform", elements: [], selected: null };
 let mujoco, model, data, policySession, activePolicy, jointAddresses, actuatorAddresses, baseRobotXml, robotAssets, robotVfs, terrainSlotIds, terrainSlotSet;
-let physicsStepsPerPolicy = POLICY_PHYSICS_STEPS;
-let actualPolicyDt = POLICY_DT;
+let physicsStepsPerPolicy = DEFAULT_POLICY_PHYSICS_STEPS;
+let actualPolicyDt = DEFAULT_MUJOCO_TIMESTEP * DEFAULT_POLICY_PHYSICS_STEPS;
 const controllerState = {
   commandSpeed: [1, 1, 1],
   keyboardKeys: new Set(),
@@ -181,24 +176,6 @@ function bootLog(text, kind = "") {
   const log = $("bootLog");
   log.append(line);
   while (log.children.length > 7) log.firstElementChild.remove();
-}
-
-// Ask the server for exact sizes first so the meter has a real denominator
-// instead of a hard-coded stage percentage.
-async function preflight(urls) {
-  await Promise.all(urls.map(async (url) => {
-    try {
-      const response = await fetch(url, { method: "HEAD" });
-      const length = Number(response.headers.get("content-length")) || 0;
-      if (length > 0 && !bootState.counted.has(url)) {
-        bootState.counted.add(url);
-        bootState.total += length;
-      }
-    } catch {
-      // Fall back to the GET response's content-length below.
-    }
-  }));
-  scheduleBootMeter();
 }
 
 async function fetchTracked(url, label) {
@@ -277,13 +254,13 @@ function createScene() {
   key.shadow.bias = -0.0005;
   scene.add(key);
   const floor = new THREE.Mesh(
-    new THREE.PlaneGeometry(TERRAIN_AREA.x * 3.4, TERRAIN_AREA.y * 3.4),
+    new THREE.PlaneGeometry(TERRAIN_AREA.x * 2, TERRAIN_AREA.y * 2),
     new THREE.MeshStandardMaterial({ color: 0xf3ebd9, roughness: 0.92 }),
   );
   floor.receiveShadow = true;
   floor.position.z = -0.002;
   scene.add(floor);
-  const grid = new THREE.GridHelper(TERRAIN_AREA.x * 3.4, 68, 0xd9c9a6, 0xeee3cb);
+  const grid = new THREE.GridHelper(TERRAIN_AREA.x * 2, 100, 0xd9c9a6, 0xeee3cb);
   // GridHelper is horizontal in Three.js' Y-up world. This scene and MuJoCo
   // model use Z-up, so rotate it onto the physical floor plane.
   grid.rotation.x = Math.PI / 2;
@@ -410,9 +387,11 @@ function createMujocoModel(xml, terrainCount) {
   model?.delete?.();
   model = mujoco.MjModel.from_xml_string(xml, robotVfs);
   data = new mujoco.MjData(model);
-  const policyStepRatio = POLICY_DT / model.opt.timestep;
-  if (Math.abs(model.opt.timestep - MUJOCO_TIMESTEP) > 1e-9 || !Number.isInteger(policyStepRatio) || policyStepRatio !== POLICY_PHYSICS_STEPS) {
-    throw new Error(`MuJoCo timestep 必须为 ${MUJOCO_TIMESTEP}s，且策略周期必须由 ${POLICY_PHYSICS_STEPS} 个物理步组成。`);
+  const timestep = activePolicy?.timestep ?? DEFAULT_MUJOCO_TIMESTEP;
+  const configuredSteps = activePolicy?.physicsStepsPerPolicy ?? DEFAULT_POLICY_PHYSICS_STEPS;
+  const policyStepRatio = (timestep * configuredSteps) / model.opt.timestep;
+  if (Math.abs(model.opt.timestep - timestep) > 1e-9 || !Number.isInteger(policyStepRatio) || policyStepRatio !== configuredSteps) {
+    throw new Error(`MuJoCo timestep 必须为 ${timestep}s，且策略周期必须由 ${configuredSteps} 个物理步组成。`);
   }
   physicsStepsPerPolicy = policyStepRatio;
   actualPolicyDt = physicsStepsPerPolicy * model.opt.timestep;
@@ -555,7 +534,7 @@ function elementBoxes(element) {
 function terrainBoxes() {
   // The Three.js floor is visual only. This explicit MuJoCo box carries the
   // physics floor so the robot cannot fall through gaps between obstacles.
-  return [box(0, 0, -0.05, 5, 5, .05, 0, "场地地面"), ...profileBoxes(), ...terrainState.elements.flatMap(elementBoxes)];
+  return [box(0, 0, -0.05, TERRAIN_AREA.x, TERRAIN_AREA.y, .05, 0, "场地地面"), ...profileBoxes(), ...terrainState.elements.flatMap(elementBoxes)];
 }
 
 function clearTerrainVisual() {
@@ -593,6 +572,9 @@ function terrainXml() {
   const document = new DOMParser().parseFromString(baseRobotXml, "text/xml");
   const worldbody = document.querySelector("worldbody");
   const asset = document.querySelector("asset");
+  const option = document.querySelector("option") ?? document.createElement("option");
+  option.setAttribute("timestep", String(activePolicy?.timestep ?? DEFAULT_MUJOCO_TIMESTEP));
+  if (!option.parentNode) document.documentElement.insertBefore(option, worldbody);
   // Joint armature and actuator gains mirror OPENDOGE_ACTUATOR_* in training.
   for (const joint of document.querySelectorAll("worldbody joint")) {
     joint.setAttribute("armature", String(ACTUATOR_ARMATURE));
@@ -679,19 +661,37 @@ async function applyTerrain() {
 }
 
 async function loadPolicy(key, buffer) {
-  activePolicy = policies[key];
+  const nextPolicy = policies[key];
+  if (!nextPolicy) throw new Error(`未知策略：${key}`);
   simulation.running = false;
   $("start").textContent = "开始";
+  $("policy").value = key;
+  const previousPolicy = activePolicy;
+  const previousSession = policySession;
+  activePolicy = nextPolicy;
   $("policyName").textContent = activePolicy.name;
-  const detail = activePolicy.mode === "rough" ? "本体 + 地形扫描" : activePolicy.mode === "skills" ? `多技能 · ${activePolicy.skill}` : "本体观测";
-  $("policyMeta").textContent = `${activePolicy.inputSize} 维观测 · ${detail}`;
+  const detail = activePolicy.mode === "supermimic" ? `${activePolicy.historyLength} 帧历史 · ${activePolicy.frameSize} 维/帧`
+    : activePolicy.mode === "skills" ? `多技能 · ${activePolicy.skill}` : "本体观测";
+  $("policyMeta").textContent = `${activePolicy.inputSize} 维输入 · ${detail}`;
   simulation.command.fill(0);
   configureCommandControls();
   recomputeCommand();
   updateControls();
   setNotice(`正在加载「${activePolicy.name}」ONNX 策略…`);
-  policySession = await ort.InferenceSession.create(buffer ?? publicAsset(activePolicy.file), { executionProviders: ["wasm"] });
-  reset();
+  try {
+    const nextSession = await ort.InferenceSession.create(buffer ?? publicAsset(activePolicy.file), { executionProviders: ["wasm"] });
+    const timestepChanged = previousPolicy && (previousPolicy.timestep ?? DEFAULT_MUJOCO_TIMESTEP) !== (activePolicy.timestep ?? DEFAULT_MUJOCO_TIMESTEP);
+    if (timestepChanged && baseRobotXml) {
+      createMujocoModel(terrainXml(), terrainBoxes().length);
+      renderTerrain();
+    }
+    policySession = nextSession;
+    reset();
+  } catch (error) {
+    activePolicy = previousPolicy;
+    policySession = previousSession;
+    throw error;
+  }
   setNotice(`${activePolicy.note} 点击“开始”后，物理和策略均在此浏览器中运行。`);
 }
 
@@ -712,6 +712,7 @@ function reset() {
   data.ctrl.fill(0);
   simulation.action.fill(0);
   simulation.actionHistory = [];
+  simulation.observationHistory = [];
   simulation.elapsed = 0;
   simulation.realTimeAccumulator = 0;
   mujoco.mj_forward(model, data);
@@ -722,93 +723,43 @@ function bodyQuaternion() {
   return new THREE.Quaternion(data.qpos[4], data.qpos[5], data.qpos[6], data.qpos[3]);
 }
 
-function observation() {
+function observationFrame() {
   const inverse = bodyQuaternion().invert();
-  // Free-joint linear velocity is global, angular velocity is already body
-  // frame. mjlab reads the velocimeter mounted at the imu site, so include the
-  // small lever-arm term for that 3 cm offset.
+  // MuJoCo free-joint rotational qvel is expressed in the body frame, matching
+  // training data.root_link_ang_vel_b; rotating it again corrupts the observation.
   const angular = new THREE.Vector3(data.qvel[3], data.qvel[4], data.qvel[5]);
-  const linear = new THREE.Vector3(data.qvel[0], data.qvel[1], data.qvel[2])
-    .applyQuaternion(inverse)
-    .add(new THREE.Vector3().crossVectors(angular, new THREE.Vector3(0, 0, 0.03)));
+  const angularWorld = angular.clone().applyQuaternion(bodyQuaternion());
   const gravity = new THREE.Vector3(0, 0, -1).applyQuaternion(inverse);
-  const values = [
-    linear.x, linear.y, linear.z,
-    angular.x, angular.y, angular.z,
-    gravity.x, gravity.y, gravity.z,
-  ];
+  const values = activePolicy.mode === "supermimic"
+    ? [angular.x, angular.y, angular.z, gravity.x, gravity.y, gravity.z]
+    : (() => {
+      const linear = new THREE.Vector3(data.qvel[0], data.qvel[1], data.qvel[2])
+        .applyQuaternion(inverse)
+        .add(new THREE.Vector3().crossVectors(angularWorld, new THREE.Vector3(0, 0, 0.03)));
+      return [linear.x, linear.y, linear.z, angular.x, angular.y, angular.z, gravity.x, gravity.y, gravity.z];
+    })();
   jointAddresses.forEach((address, index) => values.push(data.qpos[address.qpos] - defaultPose[index]));
   jointAddresses.forEach((address) => values.push(data.qvel[address.dof]));
-  values.push(...simulation.action);
-  values.push(simulation.command[0], simulation.command[1], simulation.command[2]);
-  if (activePolicy.mode === "rough") {
-    values.push(...heightScan());
-  } else if (activePolicy.mode === "skills") {
-    // [jump twist(3)] [one_hot(skill)(4)] [phase_sin, phase_cos] — the phase
-    // clock only advances for the jump skill, so stationary skills see (0, 1).
-    values.push(0, 0, 0);
-    const token = skillNames.indexOf(activePolicy.skill);
-    for (let index = 0; index < skillNames.length; index += 1) values.push(index === token ? 1 : 0);
-    values.push(0, 1);
+  values.push(...simulation.action, ...simulation.command);
+  if (activePolicy.mode === "supermimic") {
+    const moving = Math.hypot(simulation.command[0], simulation.command[1]) + Math.abs(simulation.command[2]) > SUPER_MIMIC_STANDING_THRESHOLD;
+    if (moving) {
+      const stepsPerPeriod = Math.round(SUPER_MIMIC_PHASE_PERIOD / actualPolicyDt);
+      const phase = (Math.round(simulation.elapsed / actualPolicyDt) % stepsPerPeriod) / stepsPerPeriod;
+      const angle = 2 * Math.PI * phase;
+      values.push(Math.sin(angle), Math.cos(angle));
+    } else values.push(0, 0);
   }
-  return new Float32Array(values);
-}
-
-// Vertical ray against the simulator's analytic terrain boxes (all MuJoCo
-// terrain geoms are boxes; the robot is excluded by construction). Returns the
-// distance to the first hit, or -1, matching mj_ray's convention.
-// Vertical ray against the simulator's analytic terrain: boxes are yaw-rotated
-// cuboids, ramps are the same triangular prism used for rendering and physics.
-// Returns the distance to the first hit, or -1, matching mj_ray's convention.
-function rayDown(x, y, z, definitions) {
-  let nearest = -1;
-  for (const definition of definitions) {
-    const yaw = definition.yaw || 0;
-    const cos = Math.cos(yaw);
-    const sin = Math.sin(yaw);
-    const dx = x - definition.x;
-    const dy = y - definition.y;
-    const localX = cos * dx + sin * dy;
-    const localY = -sin * dx + cos * dy;
-    if (Math.abs(localX) > definition.sx || Math.abs(localY) > definition.sy) continue;
-    const hitZ = definition.type === "ramp"
-      ? definition.z + definition.sz * (localX / definition.sx)
-      : definition.z + definition.sz;
-    if (hitZ > z) continue;
-    const distance = z - hitZ;
-    if (nearest < 0 || distance < nearest) nearest = distance;
-  }
-  return nearest;
-}
-
-function heightScan() {
-  const bodyId = model.body("base_link").id;
-  const px = data.xpos[bodyId * 3];
-  const py = data.xpos[bodyId * 3 + 1];
-  const pz = data.xpos[bodyId * 3 + 2];
-  const matrix = data.xmat;
-  const yaw = Math.atan2(matrix[bodyId * 9 + 3], matrix[bodyId * 9]);
-  const cos = Math.cos(yaw);
-  const sin = Math.sin(yaw);
-  const boxes = terrainBoxes();
-  const scan = new Float32Array(SCAN_COLUMNS * SCAN_ROWS);
-  let index = 0;
-  for (let row = 0; row < SCAN_ROWS; row += 1) {
-    const gy = -0.25 + row * SCAN_STEP;
-    for (let column = 0; column < SCAN_COLUMNS; column += 1) {
-      const gx = -0.35 + column * SCAN_STEP;
-      const x = px + cos * gx - sin * gy;
-      const y = py + sin * gx + cos * gy;
-      const distance = rayDown(x, y, pz, boxes);
-      scan[index] = (distance < 0 ? SCAN_MISS : distance) * SCAN_SCALE;
-      index += 1;
-    }
-  }
-  return scan;
+  const frame = new Float32Array(values);
+  if (activePolicy.mode !== "supermimic") return frame;
+  simulation.observationHistory.push(frame);
+  if (simulation.observationHistory.length > activePolicy.historyLength) simulation.observationHistory.shift();
+  while (simulation.observationHistory.length < activePolicy.historyLength) simulation.observationHistory.unshift(frame);
+  return new Float32Array(simulation.observationHistory.flatMap((sample) => Array.from(sample)));
 }
 
 async function policyStep() {
-  const obs = observation();
+  const obs = observationFrame();
   if (obs.length !== activePolicy.inputSize) throw new Error(`策略观测维度不匹配：${obs.length} / ${activePolicy.inputSize}`);
   const inputName = policySession.inputNames[0];
   const outputName = policySession.outputNames[0];
@@ -822,7 +773,8 @@ function applyControl() {
   jointAddresses.forEach((address, index) => {
     // Position target = default pose + scaled policy action. The PD gains and
     // torque limits live inside the MuJoCo <position> actuators.
-    data.ctrl[actuatorAddresses[index]] = defaultPose[index] + ACTION_SCALE * simulation.action[index];
+    const scale = activePolicy.actionScale?.[index] ?? ACTION_SCALE;
+    data.ctrl[actuatorAddresses[index]] = defaultPose[index] + scale * simulation.action[index];
   });
 }
 
@@ -1578,7 +1530,8 @@ installKeyboardControl();
 
 async function boot() {
   const started = performance.now();
-  const policyKey = "flat";
+  const policyKey = "rough";
+  activePolicy = policies[policyKey];
 
   const xmlBuffer = await fetchTracked(publicAsset("robot/opendoge.xml"), "读取 MJCF 模型…");
   const xml = new TextDecoder().decode(xmlBuffer);
@@ -1588,9 +1541,7 @@ async function boot() {
   const policyUrl = publicAsset(policies[policyKey].file);
   const meshUrls = meshes.map(({ file }) => publicAsset(`robot/assets/${file}`));
   const urls = [...meshUrls, mujocoWasmUrl, ortWasmUrl, policyUrl];
-  setBootStage("预检资源大小…");
-  await preflight(urls);
-  bootLog(`资源 ${urls.length} 项 · ${megabytes(bootState.total)}`, "dim");
+  bootLog(`并行载入资源 ${urls.length} 项`, "dim");
 
   const [mujocoBinary, ortBinary, policyBuffer, ...meshBuffers] = await Promise.all([
     fetchTracked(mujocoWasmUrl, "下载 MuJoCo 引擎…"),

@@ -38,13 +38,20 @@ await cp(robotSource, robotTarget, { recursive: true });
 
 const policies = [
   ["flat/policy.onnx", "opendoge-flat.onnx"],
-  ["rough/policy.onnx", "opendoge-rough.onnx"],
   ["skills/policy.onnx", "opendoge-skills.onnx"],
   ["getup/policy.onnx", "opendoge-getup.onnx"],
 ];
 await mkdir(path.join(site, "public/policies"), { recursive: true });
 for (const [source, target] of policies) {
-  await copyFile(path.join(policySource, source), path.join(site, "public/policies", target));
+  const sourcePath = path.join(policySource, source);
+  if (await exists(sourcePath)) await copyFile(sourcePath, path.join(site, "public/policies", target));
+  else console.log(`[prepare-assets] ${source} not found; keeping committed ${target}.`);
+}
+const supermimicPolicy = path.join(train, "policy/opendoge_supermimic_rough_20000.onnx");
+if (await exists(supermimicPolicy)) {
+  await copyFile(supermimicPolicy, path.join(site, "public/policies/opendoge-supermimic-moects.onnx"));
+} else {
+  console.log("[prepare-assets] SuperMimic policy not found; keeping committed policy asset.");
 }
 
 console.log("[prepare-assets] synced robot model and policies from", train);
